@@ -1,10 +1,6 @@
 *.log
 *.token
-venv/
-.venv/
-secrets/
-__pycache__/
-*.pyc
+*.csv
 
 # local-only
 venv/
@@ -13,9 +9,12 @@ secrets/
 __pycache__/
 *.pyc
 
-# local-only
-venv/
-.venv/
-secrets/
-__pycache__/
-*.pyc
+
+# generated/runtime
+state/
+downloads/
+
+# python build artifacts
+*.egg-info/
+dist/
+build/
