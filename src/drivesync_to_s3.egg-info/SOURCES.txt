@@ -1,0 +1,11 @@
+LICENSE
+README.md
+pyproject.toml
+src/drivesync/__init__.py
+src/drivesync/cli.py
+src/drivesync_to_s3.egg-info/PKG-INFO
+src/drivesync_to_s3.egg-info/SOURCES.txt
+src/drivesync_to_s3.egg-info/dependency_links.txt
+src/drivesync_to_s3.egg-info/entry_points.txt
+src/drivesync_to_s3.egg-info/requires.txt
+src/drivesync_to_s3.egg-info/top_level.txt

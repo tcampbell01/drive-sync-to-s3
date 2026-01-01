@@ -1,0 +1,7 @@
+*.log
+*.token
+venv/
+.venv/
+secrets/
+__pycache__/
+*.pyc
