@@ -5,3 +5,10 @@ venv/
 secrets/
 __pycache__/
 *.pyc
+
+# local-only
+venv/
+.venv/
+secrets/
+__pycache__/
+*.pyc
