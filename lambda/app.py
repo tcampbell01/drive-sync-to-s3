@@ -4,7 +4,7 @@ import io
 import json
 import re
 from datetime import datetime, timezone
-from typing import Dict, Optional, List
+from typing import Dict, Optional, Set
 
 import boto3
 from google.auth.transport.requests import Request
@@ -19,7 +19,7 @@ from googleapiclient.http import MediaIoBaseDownload
 SECRET_ID = "drivesync/google-oauth"
 SSM_PARAM = "/drivesync/startPageToken"
 S3_BUCKET = "google-drivesync-backup"
-S3_PREFIX = "drivesync"  # final keys look like: drivesync/My Drive/path/file.ext
+S3_PREFIX = "drivesync"
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
@@ -36,52 +36,29 @@ GOOGLE_EXPORTS = {
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         ".pptx",
     ),
-    # Optional later: drawings can be exported (PNG/PDF). Keeping out for now to avoid surprises.
-    # "application/vnd.google-apps.drawing": ("image/png", ".png"),
 }
 
-# Cache folder metadata to reduce API calls across files in one invocation
 FOLDER_CACHE: Dict[str, Dict] = {}
+PROCESSED_FILE_IDS: Set[str] = set()
 
 # ======================
 # Helpers
 # ======================
 
-
-def now_ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
 def safe_name(name: str) -> str:
-    """
-    Safe for filenames (not for full paths). Used for S3 object "leaf" names.
-    """
     name = (name or "").strip()
     name = re.sub(r"[^\w.\- ()]", "_", name)
     name = re.sub(r"\s+", " ", name)
     return name[:150]
 
 
-def safe_segment(seg: str) -> str:
+def stable_key(prefix: str, name: str, file_id: str) -> str:
     """
-    Safe for one folder segment (keeps '/' out).
+    Stable S3 key: one object per Drive file.
+    Overwrites on update, no duplicates.
     """
-    seg = (seg or "").strip()
-    seg = re.sub(r"[^\w.\- ()]", "_", seg)
-    seg = re.sub(r"\s+", " ", seg)
-    seg = seg.strip(" .")
-    return (seg or "_")[:100]
-
-
-def build_s3_key(prefix: str, folder_segments: List[str], filename: str) -> str:
-    """
-    Construct a stable S3 key that preserves folder structure as prefixes.
-    """
-    cleaned_segments = [safe_segment(s) for s in folder_segments if s]
-    cleaned_filename = safe_name(filename)
-    if cleaned_segments:
-        return f"{prefix}/" + "/".join(cleaned_segments) + f"/{cleaned_filename}"
-    return f"{prefix}/{cleaned_filename}"
+    base = safe_name(name)
+    return f"{prefix}{base}__{file_id}"
 
 
 def get_secret() -> dict:
@@ -120,17 +97,9 @@ def ssm_put(val: str) -> None:
     ssm.put_parameter(Name=SSM_PARAM, Value=val, Type="String", Overwrite=True)
 
 
-def resolve_folder_segments(drive, parents) -> List[str]:
-    """
-    Build folder segments like: ["My Drive", "Top", "Child", "Grandchild"]
-    by walking parents[0] upward.
-    Uses a cache to reduce API calls.
-    """
-    # Always anchor to "My Drive" for readability (S3 doesn't have a true Drive root)
-    segments: List[str] = ["My Drive"]
-
+def resolve_folder_path(drive, parents) -> str:
     if not parents:
-        return segments
+        return ""
 
     parent_id = parents[0]
     parts = []
@@ -139,18 +108,13 @@ def resolve_folder_segments(drive, parents) -> List[str]:
         if parent_id in FOLDER_CACHE:
             meta = FOLDER_CACHE[parent_id]
         else:
-            meta = (
-                drive.files()
-                .get(
-                    fileId=parent_id,
-                    fields="id,name,parents,mimeType",
-                    supportsAllDrives=True,
-                )
-                .execute()
-            )
+            meta = drive.files().get(
+                fileId=parent_id,
+                fields="id,name,parents,mimeType",
+                supportsAllDrives=True,
+            ).execute()
             FOLDER_CACHE[parent_id] = meta
 
-        # Only folders contribute to the path
         if meta.get("mimeType") != "application/vnd.google-apps.folder":
             break
 
@@ -158,17 +122,10 @@ def resolve_folder_segments(drive, parents) -> List[str]:
         p = meta.get("parents") or []
         parent_id = p[0] if p else None
 
-    # reverse to root->leaf order, then append after "My Drive"
-    parts = list(reversed(parts))
-    segments.extend(parts)
-    return segments
+    return "/".join(reversed(parts))
 
 
 def download_bytes(drive, file_id: str) -> bytes:
-    """
-    Download binary content for non-Google-native files.
-    (Will 403 for application/vnd.google-apps.* types.)
-    """
     req = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
     buf = io.BytesIO()
     dl = MediaIoBaseDownload(buf, req)
@@ -179,9 +136,6 @@ def download_bytes(drive, file_id: str) -> bytes:
 
 
 def export_bytes(drive, file_id: str, export_mime: str) -> bytes:
-    """
-    Export Google Docs Editors files (Docs/Sheets/Slides) into a downloadable format.
-    """
     req = drive.files().export_media(fileId=file_id, mimeType=export_mime)
     buf = io.BytesIO()
     dl = MediaIoBaseDownload(buf, req)
@@ -192,10 +146,6 @@ def export_bytes(drive, file_id: str, export_mime: str) -> bytes:
 
 
 def resolve_shortcut(drive, file: dict) -> Optional[dict]:
-    """
-    If this is a Drive shortcut, return the target file metadata.
-    Otherwise return None.
-    """
     sd = file.get("shortcutDetails")
     if not sd:
         return None
@@ -204,22 +154,16 @@ def resolve_shortcut(drive, file: dict) -> Optional[dict]:
     if not target_id:
         return None
 
-    target = (
-        drive.files()
-        .get(
-            fileId=target_id,
-            fields="id,name,mimeType,modifiedTime,trashed,parents,shortcutDetails",
-            supportsAllDrives=True,
-        )
-        .execute()
-    )
-    return target
+    return drive.files().get(
+        fileId=target_id,
+        fields="id,name,mimeType,modifiedTime,trashed,parents",
+        supportsAllDrives=True,
+    ).execute()
 
 
 # ======================
 # Lambda entrypoint
 # ======================
-
 
 def handler(event, context):
     secret = get_secret()
@@ -229,7 +173,7 @@ def handler(event, context):
 
     token = ssm_get()
 
-    # First run: initialize startPageToken
+    # First run: initialize token
     if not token or token == "INIT":
         start = drive.changes().getStartPageToken().execute()
         ssm_put(start["startPageToken"])
@@ -242,85 +186,72 @@ def handler(event, context):
     skipped = 0
     page_token = token
 
-    # Deduplicate within a single invocation (Drive can emit multiple changes for same file)
-    seen_file_ids = set()
-
     while page_token:
-        resp = (
-            drive.changes()
-            .list(
-                pageToken=page_token,
-                spaces="drive",
-                includeItemsFromAllDrives=True,
-                supportsAllDrives=True,
-                fields=(
-                    "newStartPageToken,nextPageToken,"
-                    "changes(fileId,removed,file("
-                    "name,mimeType,modifiedTime,trashed,parents,shortcutDetails))"
-                ),
-            )
-            .execute()
-        )
+        resp = drive.changes().list(
+            pageToken=page_token,
+            spaces="drive",
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+            fields=(
+                "newStartPageToken,nextPageToken,"
+                "changes(fileId,removed,file("
+                "name,mimeType,modifiedTime,trashed,parents,shortcutDetails))"
+            ),
+        ).execute()
 
         for change in resp.get("changes", []):
-            change_file_id = change.get("fileId")
+            file_id = change.get("fileId")
             removed = change.get("removed", False)
             file = change.get("file") or {}
 
-            if removed or file.get("trashed") or not change_file_id:
+            if removed or file.get("trashed") or not file_id:
                 skipped += 1
                 continue
 
-            name = file.get("name") or change_file_id
-            mime = file.get("mimeType", "application/octet-stream")
-            modified = file.get("modifiedTime", "")
-
-            # --- Handle shortcuts first (we want stable keys based on the *target* file) ---
-            if mime == "application/vnd.google-apps.shortcut":
+            # Shortcut resolution
+            if file.get("mimeType") == "application/vnd.google-apps.shortcut":
                 target = resolve_shortcut(drive, file)
                 if not target or target.get("trashed"):
                     skipped += 1
                     continue
-
-                # Replace current metadata with target metadata
                 file = target
-                change_file_id = target.get("id")
-                name = target.get("name") or change_file_id
-                mime = target.get("mimeType", "application/octet-stream")
-                modified = target.get("modifiedTime", modified)
+                file_id = target["id"]
 
-            # Dedupe (after shortcut resolution so we dedupe on real target id)
-            if change_file_id in seen_file_ids:
+            if file_id in PROCESSED_FILE_IDS:
                 skipped += 1
                 continue
-            seen_file_ids.add(change_file_id)
+            PROCESSED_FILE_IDS.add(file_id)
 
-            # Skip folders (not downloadable)
+            name = safe_name(file.get("name") or file_id)
+            mime = file.get("mimeType", "application/octet-stream")
+            modified = file.get("modifiedTime", "")
+
+            folder_path = resolve_folder_path(drive, file.get("parents"))
+            prefix = (
+                f"{S3_PREFIX}/{safe_name(folder_path)}/"
+                if folder_path
+                else f"{S3_PREFIX}/"
+            )
+
+            # Skip folders
             if mime == "application/vnd.google-apps.folder":
                 skipped += 1
                 continue
 
-            # Build stable folder segments and stable key (overwrite in place)
-            folder_segments = resolve_folder_segments(drive, file.get("parents"))
-            # Note: folder_segments already starts with ["My Drive", ...]
-            # filename will be adjusted for exports below
-            base_filename = safe_name(name)
-
-            # --- Export Docs/Sheets/Slides (stable .docx/.xlsx/.pptx name) ---
+            # Google Docs exports
             if mime in GOOGLE_EXPORTS:
                 export_mime, ext = GOOGLE_EXPORTS[mime]
-                out_name = base_filename if base_filename.lower().endswith(ext) else f"{base_filename}{ext}"
+                out_name = name if name.lower().endswith(ext) else f"{name}{ext}"
+                key = stable_key(prefix, out_name, file_id)
 
-                key = build_s3_key(S3_PREFIX, folder_segments, out_name)
-
-                data = export_bytes(drive, change_file_id, export_mime)
+                data = export_bytes(drive, file_id, export_mime)
                 s3.put_object(
                     Bucket=S3_BUCKET,
                     Key=key,
                     Body=data,
                     ContentType=export_mime,
                     Metadata={
-                        "drive_file_id": change_file_id,
+                        "drive_file_id": file_id,
                         "drive_modified_time": modified,
                         "drive_source_mime": mime,
                     },
@@ -328,26 +259,22 @@ def handler(event, context):
                 uploaded += 1
                 continue
 
-            # Any other Google-native types cannot be downloaded with get_media()
+            # Skip non-exportable Google-native files
             if mime.startswith("application/vnd.google-apps."):
-                print(
-                    f"Skipping non-exportable Google file type: {mime} "
-                    f"name={base_filename} id={change_file_id}"
-                )
+                print(f"Skipping non-exportable Google file type: {mime} name={name}")
                 skipped += 1
                 continue
 
-            # --- Binary files (regular downloads) ---
-            key = build_s3_key(S3_PREFIX, folder_segments, base_filename)
-
-            data = download_bytes(drive, change_file_id)
+            # Binary files
+            key = stable_key(prefix, name, file_id)
+            data = download_bytes(drive, file_id)
             s3.put_object(
                 Bucket=S3_BUCKET,
                 Key=key,
                 Body=data,
                 ContentType=mime,
                 Metadata={
-                    "drive_file_id": change_file_id,
+                    "drive_file_id": file_id,
                     "drive_modified_time": modified,
                 },
             )
