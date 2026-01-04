@@ -1,51 +1,46 @@
 # drive-sync-to-s3
 
-1. Make sure you are at the root level
-2. Delete old build artifacts: 
-
-```
+# 1. Clean up
 rm -rf lambda_build
 rm -f lambda_package.zip
-```
 
-3. Create a fresh build directory
-
-```
+# 2. Create build directory
 mkdir -p lambda_build
 
-4. Copy the lambda source code
-
-``` 
+# 3. Copy your app.py
 cp lambda/app.py lambda_build/app.py
-```
 
-5. install python dependencies INTO build folder
-
-```
+# 4. Install dependencies directly into lambda_build (NOT lambda_build/app)
 python3.11 -m pip install \
-  -t lambda_build/app \
+  -t lambda_build \
   google-api-python-client \
   google-auth \
   google-auth-oauthlib \
   google-auth-httplib2
-```
 
-NOTE: -t allows you to install into the folder regardless of what directory you are in
-
-6. Create the zip
-```
+# 5. Create zip
 cd lambda_build
 zip -r ../lambda_package.zip .
-cd ../../
-```
+cd ..
 
-7. Upload the zip to AWS lambda
 
-8. Verify lambda handler
+Copy
+The structure should be:
 
-lambda --> configuration --> runtime setting
-- should be Handler = app.handler
+lambda_build/
+├── app.py
+├── google/
+├── googleapiclient/
+└── other dependencies...
 
+Copy
+Not:
+
+lambda_build/
+├── app.py
+└── app/
+    ├── google/
+    └── googleapiclient/
 
 
 Google Drive → AWS S3 Sync
